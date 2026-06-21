@@ -34,36 +34,34 @@ impl Transform for FilterLodTransform {
         // Extract the largest LOD with a texture. If there is no texture, extract the largest LOD.
         match self.mode {
             LodFilterMode::TexturedHighest => {
+                // Pick the highest LOD that actually has a texture; fall back to the highest LOD.
+                //
+                // FIX: the previous implementation called the DESTRUCTIVE `edit_tree` inside the
+                // probing loop and judged "has texture" from the whole-entity `appearance_store`
+                // (LOD-independent, and never pruned by `edit_tree`). For entities without any
+                // texture this progressively destroyed the geometry tree, making whole (untextured)
+                // buildings disappear. We now probe NON-destructively using `polygon_textures`
+                // (per-polygon texture assignment, already resolved by ApplyAppearanceTransform,
+                // which runs before this transform) and call `edit_tree` exactly once.
                 let available_lods = find_lods(&entity.root) & self.mask;
-                let mut highest_textured_lod = None;
-
-                // The “maximum LOD” is set from the beginning. If the texture does not exist, the maximum LOD is returned immediately.
-                let highest_available_lod = available_lods.highest_lod().unwrap_or(0);
-
-                // Creating a reverse-order iterator with ev
-                for lod in (0..=highest_available_lod).rev() {
-                    if available_lods.0 & (1 << lod) != 0 {
-                        edit_tree(&mut entity.root, lod);
-
-                        let has_textures = {
-                            let appearance = entity.appearance_store.read().unwrap();
-                            !appearance.textures.is_empty()
-                        };
-
-                        // If a LOD with the texture is found, save it and exit.
-                        if has_textures {
-                            highest_textured_lod = Some(lod);
+                let Some(highest_available_lod) = available_lods.highest_lod() else {
+                    return;
+                };
+                let target_lod = {
+                    let geom = entity.geometry_store.read().unwrap();
+                    let mut chosen = None;
+                    for lod in (0..=highest_available_lod).rev() {
+                        if available_lods.has_lod(lod)
+                            && lod_has_texture(&entity.root, lod, &geom.polygon_textures)
+                        {
+                            chosen = Some(lod);
                             break;
                         }
                     }
-                }
-
-                // If “highest_textured_lod” is not None, use “highest_textured_lod”
-                // If it is None, use ”highest_available_lod”
-                if let Some(lod) = highest_textured_lod.or(Some(highest_available_lod)) {
-                    edit_tree(&mut entity.root, lod);
-                    out.push(entity);
-                }
+                    chosen.unwrap_or(highest_available_lod)
+                };
+                edit_tree(&mut entity.root, target_lod);
+                out.push(entity);
             }
             LodFilterMode::Highest => {
                 let lods = find_lods(&entity.root) & self.mask;
@@ -117,6 +115,40 @@ fn edit_tree(value: &mut Value, target_lod: u8) -> bool {
             !arr.is_empty()
         }
         _ => true,
+    }
+}
+
+/// Whether any geometry at `target_lod` has a textured polygon (non-destructive).
+///
+/// `GeometryRef { pos, len }` spans `[pos, pos+len)` of the polygons, aligned with
+/// `polygon_textures` (per-polygon texture assignment). `polygon_textures` is empty when
+/// appearance resolution is disabled, in which case this returns false (callers fall back
+/// to the highest LOD).
+fn lod_has_texture(value: &Value, target_lod: u8, polygon_textures: &[Option<u32>]) -> bool {
+    match value {
+        Value::Object(obj) => {
+            if let ObjectStereotype::Feature { geometries, .. } = &obj.stereotype {
+                for geom in geometries {
+                    if geom.lod == target_lod {
+                        let start = geom.pos as usize;
+                        let end = start + geom.len as usize;
+                        if polygon_textures
+                            .get(start..end)
+                            .is_some_and(|s| s.iter().any(|t| t.is_some()))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            obj.attributes
+                .values()
+                .any(|v| lod_has_texture(v, target_lod, polygon_textures))
+        }
+        Value::Array(arr) => arr
+            .iter()
+            .any(|v| lod_has_texture(v, target_lod, polygon_textures)),
+        _ => false,
     }
 }
 
@@ -204,7 +236,81 @@ impl BitAnd for LodMask {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::RwLock;
+
+    use nusamai_citygml::{
+        geometry::{GeometryRef, GeometryType},
+        object::Object,
+        GeometryStore,
+    };
+    use nusamai_plateau::Entity;
+
     use super::*;
+    use crate::pipeline::feedback::watcher;
+
+    /// Build a single-feature entity from `(lod, polygon_index)` geometries and per-polygon
+    /// texture assignments, run `TexturedHighest`, and return the surviving geometry LODs.
+    fn run_textured_highest(geoms: &[(u8, u32)], polygon_textures: Vec<Option<u32>>) -> Vec<u8> {
+        let geometries: Vec<GeometryRef> = geoms
+            .iter()
+            .map(|&(lod, pos)| GeometryRef {
+                ty: GeometryType::Solid,
+                lod,
+                pos,
+                len: 1,
+            })
+            .collect();
+        let geometry_store = GeometryStore {
+            polygon_textures,
+            ..Default::default()
+        };
+        let entity = Entity {
+            root: Value::Object(Object {
+                typename: "bldg:Building".into(),
+                attributes: Default::default(),
+                stereotype: ObjectStereotype::Feature {
+                    id: "b1".into(),
+                    geometries,
+                },
+            }),
+            base_url: url::Url::parse("file:///dummy").unwrap(),
+            geometry_store: RwLock::new(geometry_store).into(),
+            appearance_store: Default::default(),
+        };
+        let (_watcher, feedback, _canceller) = watcher();
+        let mut transform = FilterLodTransform::new(LodMask::all(), LodFilterMode::TexturedHighest);
+        let mut out = Vec::new();
+        transform.transform(&feedback, entity, &mut out);
+        let mut lods = Vec::new();
+        for entity in &out {
+            if let Value::Object(obj) = &entity.root {
+                if let ObjectStereotype::Feature { geometries, .. } = &obj.stereotype {
+                    lods.extend(geometries.iter().map(|g| g.lod));
+                }
+            }
+        }
+        lods.sort_unstable();
+        lods
+    }
+
+    #[test]
+    fn textured_highest_keeps_geometry_when_untextured() {
+        // A building with no textured polygon must NOT vanish: it falls back to the highest LOD.
+        // (Regression: the previous destructive probe loop left such entities with empty geometry.)
+        let lods = run_textured_highest(&[(1, 0), (2, 1)], vec![None, None]);
+        assert_eq!(lods, vec![2]);
+    }
+
+    #[test]
+    fn textured_highest_prefers_a_textured_lod() {
+        // Highest LOD (2) is untextured but a lower LOD (1) is textured -> pick the textured one.
+        let lods = run_textured_highest(&[(1, 0), (2, 1)], vec![Some(0), None]);
+        assert_eq!(lods, vec![1]);
+        // Highest LOD (2) is textured -> pick it.
+        let lods = run_textured_highest(&[(1, 0), (2, 1)], vec![None, Some(0)]);
+        assert_eq!(lods, vec![2]);
+    }
+
     #[test]
     fn test_lod_mask() {
         let mut mask = LodMask::default();
